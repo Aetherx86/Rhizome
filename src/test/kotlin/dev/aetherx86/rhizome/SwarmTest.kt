@@ -655,7 +655,7 @@ class SwarmTest {
 }
 
 /** A misbehaving peer, scripted by each test. It claims to hold all [pieces] of the torrent. */
-private class EvilPeer(
+internal class EvilPeer(
     private val infoHash: ByteArray,
     private val pieces: Int = 0,
     private val unchoke: Boolean = true,

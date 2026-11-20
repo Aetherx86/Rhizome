@@ -15,9 +15,17 @@ fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
 fun hexToBytes(text: String): ByteArray? {
     if (text.length % 2 != 0) return null
+    // Character.digit also accepts digits from other scripts, such as fullwidth forms. Only ASCII
+    // spells a hash, so anything else is refused rather than read as some other hash.
+    fun digit(c: Char): Int = when (c) {
+        in '0'..'9' -> c - '0'
+        in 'a'..'f' -> c - 'a' + 10
+        in 'A'..'F' -> c - 'A' + 10
+        else -> -1
+    }
     return ByteArray(text.length / 2) { i ->
-        val high = Character.digit(text[i * 2], 16)
-        val low = Character.digit(text[i * 2 + 1], 16)
+        val high = digit(text[i * 2])
+        val low = digit(text[i * 2 + 1])
         if (high < 0 || low < 0) return null
         ((high shl 4) or low).toByte()
     }
@@ -151,7 +159,11 @@ class Metainfo private constructor(
                     }
                     if (!seen.add(parts)) throw InvalidTorrent("duplicate file: ${parts.joinToString("/")}")
                     files.add(TorrentFile(listOf(name) + parts, length, total))
-                    total = Math.addExact(total, length)
+                    total = try {
+                        Math.addExact(total, length)
+                    } catch (_: ArithmeticException) {
+                        throw InvalidTorrent("the file lengths add up to more than 2^63 bytes")
+                    }
                 }
                 if (files.isEmpty()) throw InvalidTorrent("the torrent lists no files")
                 // A file and a folder cannot share one name, and on disk one would clobber the other.
@@ -183,6 +195,7 @@ class Metainfo private constructor(
             pieceLength: Int,
             trackers: List<String> = emptyList(),
             singleFile: Boolean = files.size == 1 && files[0].first.size == 1 && files[0].first[0] == name,
+            isPrivate: Boolean = false,
         ): ByteArray {
             val all = java.io.ByteArrayOutputStream()
             for ((_, data) in files) all.writeBytes(data)
@@ -203,6 +216,7 @@ class Metainfo private constructor(
             } else {
                 info["files"] = files.map { (path, data) -> mapOf("length" to data.size, "path" to path) }
             }
+            if (isPrivate) info["private"] = 1
             val root = HashMap<String, Any>()
             root["info"] = info
             if (trackers.isNotEmpty()) {
@@ -225,8 +239,9 @@ class Magnet(val infoHash: ByteArray, val name: String?, val trackers: List<Stri
             var buffer = 0
             var bits = 0
             var index = 0
-            for (c in text.uppercase()) {
-                val value = BASE32.indexOf(c)
+            // One character at a time: String.uppercase() can lengthen text, turning 'ﬃ' into "FFI".
+            for (c in text) {
+                val value = BASE32.indexOf(c.uppercaseChar())
                 if (value < 0) return null
                 buffer = (buffer shl 5) or value
                 bits += 5

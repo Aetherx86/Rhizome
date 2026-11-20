@@ -14,12 +14,17 @@ import java.util.BitSet
  * Metadata has already rejected unsafe names. This class checks again against the real filesystem,
  * since a folder inside the download directory could be a symbolic link pointing somewhere else.
  */
-class PieceStore(private val meta: Metainfo, private val root: Path) : AutoCloseable {
+class PieceStore(
+    private val meta: Metainfo,
+    private val root: Path,
+    /** Opens files for reading only and never creates anything, for checking data in place. */
+    private val readOnly: Boolean = false,
+) : AutoCloseable {
     private val realRoot: Path
     private val handles = HashMap<Int, RandomAccessFile>()
 
     init {
-        Files.createDirectories(root)
+        if (!readOnly) Files.createDirectories(root)
         realRoot = root.toRealPath()
     }
 
@@ -43,10 +48,11 @@ class PieceStore(private val meta: Metainfo, private val root: Path) : AutoClose
         handles[index]?.let { return it }
         val path = pathOf(meta.files[index])
         checkNoLinks(path)
+        if (forWriting && readOnly) throw IOException("this store is read-only")
         if (!forWriting && !Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return null
-        Files.createDirectories(path.parent)
+        if (!readOnly) Files.createDirectories(path.parent)
         checkNoLinks(path)
-        val file = RandomAccessFile(path.toFile(), "rw")
+        val file = RandomAccessFile(path.toFile(), if (readOnly) "r" else "rw")
         handles[index] = file
         return file
     }

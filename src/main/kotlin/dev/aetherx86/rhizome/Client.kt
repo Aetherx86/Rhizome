@@ -35,6 +35,8 @@ class ClientConfig(
     /** Permits trackers, peers and DHT nodes on private addresses. See [AddressPolicy]. */
     val allowPrivateAddresses: Boolean = false,
     val chokeRotationMillis: Long = 10_000,
+    /** How often peers are told about other peers (BEP 11). The extension asks for at most once a minute. */
+    val pexIntervalMillis: Long = 60_000,
 )
 
 /** Sliding window of outstanding requests per peer. One at a time would cap speed by latency. */
@@ -44,13 +46,50 @@ private const val MAX_STRIKES = 3
 private const val METADATA_PIECE_SIZE = 16 * 1024
 private const val MAX_METADATA_SIZE = 32 shl 20
 private const val OUR_UT_METADATA_ID = 1
+private const val OUR_UT_PEX_ID = 2
+
+/** The most peers taken from, or put in, either list of one peer exchange message (BEP 11). */
+private const val MAX_PEX_PEERS = 50
+private const val PEX_FLAG_SEED = 0x02
+private const val PEX_FLAG_REACHABLE = 0x10
+
+/** A snapshot of a torrent's progress, for display and for `--json` output. */
+class SessionStatus(
+    val infoHash: String,
+    /** Null until the metadata of a magnet link has arrived. */
+    val name: String?,
+    /** One of `metadata`, `downloading` or `seeding`. */
+    val state: String,
+    val piecesVerified: Int,
+    val pieceCount: Int,
+    val progress: Double,
+    val peers: Int,
+    val downloaded: Long,
+    val uploaded: Long,
+    val hashFailures: Int,
+    val pexPeersLearned: Int,
+) {
+    fun toMap(): Map<String, Any?> = linkedMapOf(
+        "info_hash" to infoHash,
+        "name" to name,
+        "state" to state,
+        "pieces_verified" to piecesVerified,
+        "piece_count" to pieceCount,
+        "progress" to progress,
+        "peers" to peers,
+        "downloaded" to downloaded,
+        "uploaded" to uploaded,
+        "hash_failures" to hashFailures,
+        "pex_peers_learned" to pexPeersLearned,
+    )
+}
 
 /** A running BitTorrent client, listening for peers on one port. */
 class RhizomeClient(val config: ClientConfig = ClientConfig(), val dht: DhtNode? = null) : AutoCloseable {
     internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val server = ServerSocket(config.port)
     private val sessions = ConcurrentHashMap<String, TorrentSession>()
-    val peerId: ByteArray = "-RZ0100-".toByteArray() + ByteArray(12).also { SecureRandom().nextBytes(it) }
+    val peerId: ByteArray = "-RZ0200-".toByteArray() + ByteArray(12).also { SecureRandom().nextBytes(it) }
     val port: Int get() = server.localPort
 
     init {
@@ -118,7 +157,18 @@ internal class PeerConnection(
     val socket: Socket,
     val remoteId: ByteArray,
     val supportsExtensions: Boolean,
+    val weInitiated: Boolean,
 ) {
+    /**
+     * Where this peer accepts connections: the address we dialed, or for a peer that dialed us,
+     * its address with the port from its extension handshake. Only these are shared through PEX.
+     */
+    var listenAddress: InetSocketAddress? =
+        if (weInitiated) socket.remoteSocketAddress as? InetSocketAddress else null
+    var peerUtPexId = 0
+    val pexAdvertised = HashSet<InetSocketAddress>()
+    var lastPexReceived = 0L
+
     val outgoing = Channel<ByteArray>(1024)
     var amChoking = true
     var amInterested = false
@@ -178,6 +228,7 @@ class TorrentSession internal constructor(
     private val downloadedBytes = AtomicLong()
     private val uploadedBytes = AtomicLong()
     private val rejectedPieces = AtomicInteger()
+    private val pexLearned = AtomicInteger()
 
     val downloaded: Long get() = downloadedBytes.get()
     val uploaded: Long get() = uploadedBytes.get()
@@ -188,6 +239,24 @@ class TorrentSession internal constructor(
     val isComplete: Boolean get() = completed.isCompleted
 
     val peerCount: Int get() = peers.size
+
+    /** Peers this torrent was told about through peer exchange and then tried to connect to. */
+    val pexPeersLearned: Int get() = pexLearned.get()
+
+    /** A snapshot of where the torrent stands. */
+    fun status(): SessionStatus {
+        val current = meta
+        val verified = servable.cardinality()
+        val state = when {
+            current == null -> "metadata"
+            isComplete -> "seeding"
+            else -> "downloading"
+        }
+        return SessionStatus(
+            infoHash.toHex(), current?.name, state, verified, current?.pieceCount ?: 0, progress(),
+            peerCount, downloaded, uploaded, hashFailures, pexPeersLearned,
+        )
+    }
 
     suspend fun awaitMetadata(): Metainfo = metadataReady.await()
 
@@ -204,6 +273,7 @@ class TorrentSession internal constructor(
             meta?.let { current -> lock.withLock { initFromMetadata(current) } }
             rotateChokes()
         }
+        client.scope.launch { pexLoop() }
     }
 
     /** Must be called with the lock held. */
@@ -244,6 +314,7 @@ class TorrentSession internal constructor(
         client.scope.launch {
             val socket = Socket()
             try {
+                if (lock.withLock { peers.any { it.listenAddress == address } }) return@launch
                 socket.connect(address, client.config.connectTimeoutMillis)
                 socket.soTimeout = client.config.connectTimeoutMillis
                 socket.getOutputStream().write(ownHandshake().encode())
@@ -276,7 +347,7 @@ class TorrentSession internal constructor(
         }
         socket.tcpNoDelay = true
         socket.soTimeout = client.config.idleTimeoutMillis
-        val peer = PeerConnection(socket, theirs.peerId, theirs.supportsExtensions)
+        val peer = PeerConnection(socket, theirs.peerId, theirs.supportsExtensions, weInitiated)
         val writer = client.scope.launch {
             val output = BufferedOutputStream(socket.getOutputStream())
             try {
@@ -295,11 +366,20 @@ class TorrentSession internal constructor(
         }
 
         val accepted = lock.withLock {
-            if (peers.size >= client.config.maxPeersPerTorrent) {
+            val duplicate = peers.firstOrNull { it.remoteId.contentEquals(peer.remoteId) }
+            if (duplicate != null && !replaces(peer, duplicate)) {
                 false
             } else {
-                peers.add(peer)
-                true
+                duplicate?.let {
+                    disconnect(it)
+                    it.close()
+                }
+                if (peers.size >= client.config.maxPeersPerTorrent) {
+                    false
+                } else {
+                    peers.add(peer)
+                    true
+                }
             }
         }
         if (!accepted) {
@@ -334,6 +414,17 @@ class TorrentSession internal constructor(
         }
     }
 
+    /**
+     * Two peers that dial each other at the same moment, which peer exchange makes likely, end up
+     * with two connections. Both sides keep the one opened by the peer with the higher id, so they
+     * agree on which one to drop without having to talk about it.
+     */
+    private fun replaces(newer: PeerConnection, existing: PeerConnection): Boolean {
+        if (newer.weInitiated == existing.weInitiated) return false
+        val weAreHigher = java.util.Arrays.compareUnsigned(client.peerId, newer.remoteId) > 0
+        return newer.weInitiated == weAreHigher
+    }
+
     private fun disconnect(peer: PeerConnection) {
         if (!peers.remove(peer)) return
         val currentPicker = picker
@@ -346,7 +437,12 @@ class TorrentSession internal constructor(
 
     private fun sendExtensionHandshake(peer: PeerConnection) {
         val body = HashMap<String, Any>()
-        body["m"] = mapOf("ut_metadata" to OUR_UT_METADATA_ID)
+        val extensions = HashMap<String, Any>()
+        extensions["ut_metadata"] = OUR_UT_METADATA_ID
+        if (pexAllowed()) extensions["ut_pex"] = OUR_UT_PEX_ID
+        body["m"] = extensions
+        body["p"] = client.port
+        body["v"] = "Rhizome $RHIZOME_VERSION"
         meta?.let { body["metadata_size"] = it.rawInfo.size }
         peer.send(PeerMessage.Extended(0, Bencode.encode(body)))
     }
@@ -552,6 +648,7 @@ class TorrentSession internal constructor(
         when (message.id) {
             0 -> lock.withLock { receiveExtensionHandshake(peer, message.payload) }
             OUR_UT_METADATA_ID -> lock.withLock { receiveMetadataMessage(peer, message.payload) }
+            OUR_UT_PEX_ID -> lock.withLock { receivePex(peer, message.payload) }
         }
     }
 
@@ -563,8 +660,15 @@ class TorrentSession internal constructor(
             null
         } ?: throw ProtocolError("a malformed extension handshake")
         val id = dict.dict("m")?.int("ut_metadata") ?: 0
-        if (id !in 0..255) throw ProtocolError("an extension id out of range")
+        val pexId = dict.dict("m")?.int("ut_pex") ?: 0
+        if (id !in 0..255 || pexId !in 0..255) throw ProtocolError("an extension id out of range")
         peer.peerUtMetadataId = id.toInt()
+        peer.peerUtPexId = pexId.toInt()
+        val listenPort = dict.int("p")
+        if (!peer.weInitiated && listenPort != null && listenPort in 1..65535) {
+            val host = (peer.socket.remoteSocketAddress as? InetSocketAddress)?.address
+            if (host != null) peer.listenAddress = InetSocketAddress(host, listenPort.toInt())
+        }
 
         val advertised = dict.int("metadata_size") ?: 0
         if (meta == null && peer.peerUtMetadataId != 0 && advertised > 0) {
@@ -669,6 +773,97 @@ class TorrentSession internal constructor(
         peer.send(PeerMessage.Extended(peer.peerUtMetadataId, header + data))
     }
 
+    /** Private torrents (BEP 27) only get peers from their trackers, so they never use PEX. */
+    private fun pexAllowed(): Boolean = meta?.isPrivate != true
+
+    private suspend fun pexLoop() {
+        while (client.scope.isActive) {
+            delay(client.config.pexIntervalMillis)
+            lock.withLock { sendPex() }
+        }
+    }
+
+    /** Tells each peer which peers joined and left since the last message. Must be called with the lock held. */
+    private fun sendPex() {
+        if (!pexAllowed()) return
+        val pieceCount = meta?.pieceCount ?: 0
+        val known = LinkedHashMap<InetSocketAddress, PeerConnection>()
+        for (peer in peers) peer.listenAddress?.let { known[it] = peer }
+        for (peer in peers) {
+            if (peer.peerUtPexId == 0) continue
+            val current = known.filterValues { it !== peer }
+            val added = current.keys.filter { it !in peer.pexAdvertised }.take(MAX_PEX_PEERS)
+            val dropped = peer.pexAdvertised.filter { it !in current }.take(MAX_PEX_PEERS)
+            if (added.isEmpty() && dropped.isEmpty()) continue
+            val flags = added.map { address ->
+                val other = current.getValue(address)
+                var flag = 0
+                if (other.weInitiated) flag = flag or PEX_FLAG_REACHABLE
+                if (pieceCount > 0 && other.has.cardinality() == pieceCount) flag = flag or PEX_FLAG_SEED
+                address to flag
+            }
+            val body = HashMap<String, Any>()
+            for ((suffix, size) in listOf("" to 4, "6" to 16)) {
+                val ours = flags.filter { it.first.address.address.size == size }
+                val gone = dropped.filter { it.address.address.size == size }
+                body["added$suffix"] = encodeCompact(ours.map { it.first })
+                body["added$suffix.f"] = ByteArray(ours.size) { ours[it].second.toByte() }
+                body["dropped$suffix"] = encodeCompact(gone)
+            }
+            peer.send(PeerMessage.Extended(peer.peerUtPexId, Bencode.encode(body)))
+            peer.pexAdvertised.addAll(added)
+            peer.pexAdvertised.removeAll(dropped.toSet())
+        }
+    }
+
+    private fun encodeCompact(addresses: List<InetSocketAddress>): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        for (address in addresses) {
+            out.writeBytes(address.address.address)
+            out.write(address.port ushr 8)
+            out.write(address.port and 0xFF)
+        }
+        return out.toByteArray()
+    }
+
+    private fun decodeCompact(bytes: ByteArray?, addressSize: Int): List<InetSocketAddress> {
+        if (bytes == null) return emptyList()
+        val entry = addressSize + 2
+        if (bytes.size % entry != 0) throw ProtocolError("a peer exchange list has an invalid length")
+        return (bytes.indices step entry).mapNotNull { at ->
+            val port = ((bytes[at + addressSize].toInt() and 0xFF) shl 8) or (bytes[at + addressSize + 1].toInt() and 0xFF)
+            if (port == 0) null else InetSocketAddress(java.net.InetAddress.getByAddress(bytes.copyOfRange(at, at + addressSize)), port)
+        }
+    }
+
+    /**
+     * Connects to peers another peer told us about. Must be called with the lock held.
+     *
+     * The list comes from a stranger, so it gets the same treatment as a tracker's: private
+     * addresses are refused, and only so many entries are taken from one message, so that a peer
+     * cannot use this client to flood a victim with connections.
+     */
+    private fun receivePex(peer: PeerConnection, payload: ByteArray) {
+        if (!pexAllowed()) return
+        val now = System.nanoTime()
+        // The extension allows one message a minute. Anything much faster is ignored.
+        val minimumGap = client.config.pexIntervalMillis * 1_000_000 / 2
+        if (peer.lastPexReceived != 0L && now - peer.lastPexReceived < minimumGap) return
+        peer.lastPexReceived = now
+        val dict = try {
+            Bencode.decode(payload) as? BDict
+        } catch (_: BencodeError) {
+            null
+        } ?: throw ProtocolError("a malformed peer exchange message")
+        val added = decodeCompact(dict.bytes("added"), 4) + decodeCompact(dict.bytes("added6"), 16)
+        for (address in added.take(MAX_PEX_PEERS)) {
+            if (!client.config.allowPrivateAddresses && !AddressPolicy.isPublic(address.address)) continue
+            if (peers.any { it.listenAddress == address }) continue
+            pexLearned.incrementAndGet()
+            connect(address)
+        }
+    }
+
     /** Announces to a tracker now, and connects to the peers it returns. */
     suspend fun announce(url: String, left: Long, event: String? = null): TrackerResponse {
         val response = TrackerClient.announce(
@@ -691,6 +886,9 @@ class TorrentSession internal constructor(
         val node = client.dht ?: return
         client.scope.launch {
             while (isActive) {
+                // A private torrent (BEP 27) gets peers from its trackers only. A magnet link
+                // cannot know whether it is private until the metadata arrives.
+                if (meta?.isPrivate == true) break
                 val found = node.getPeers(infoHash)
                 for (peer in found.peers) {
                     if (client.config.allowPrivateAddresses || AddressPolicy.isPublic(peer.address)) connect(peer)

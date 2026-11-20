@@ -11,6 +11,8 @@ rhizome info ubuntu.torrent
 rhizome download ubuntu.torrent --out ~/Downloads
 rhizome download "magnet:?xt=urn:btih:..." --out ~/Downloads --exit-when-done
 rhizome lookup c12fe1c06bba254a9dc9f519b335aa7c1367a88a
+rhizome create seed/photos --out photos.torrent
+rhizome verify photos.torrent --dir seed --json
 ```
 
 ## What it speaks
@@ -22,6 +24,8 @@ rhizome lookup c12fe1c06bba254a9dc9f519b335aa7c1367a88a
 | UDP trackers | BEP 15 |
 | DHT node: `ping`, `find_node`, `get_peers`, `announce_peer` | BEP 5 |
 | Extension protocol and metadata exchange, which make magnet links work | BEP 10, BEP 9 |
+| Peer exchange | BEP 11 |
+| Private torrents: no DHT and no peer exchange | BEP 27 |
 
 ## How it works
 
@@ -33,6 +37,12 @@ rhizome lookup c12fe1c06bba254a9dc9f519b335aa7c1367a88a
   for the next would cap throughput by latency rather than bandwidth.
 - **Lookups.** `get_peers` walks closer and closer to the target by XOR distance, asking three nodes at a
   time, and stops when the eight closest it knows have all answered.
+- **Routing table upkeep.** A full bucket keeps newcomers in a replacement cache. A contact that misses
+  two queries in a row is removed, or one if it has been quiet for 15 minutes and a replacement is waiting,
+  and the freshest replacement takes its place. Buckets nobody touched for 15 minutes are refreshed with a
+  lookup for a random id in their range.
+- **Peer exchange.** Once a minute each peer hears which peers joined and left the swarm since the last
+  message. A peer that dialed us is only shared if it told us its listening port.
 
 ## Security
 
@@ -50,6 +60,53 @@ rhizome lookup c12fe1c06bba254a9dc9f519b335aa7c1367a88a
 | Fake nodes try to flood the routing table | A node joins the table only after answering a ping, and a full bucket keeps its live contacts. |
 | An `announce_peer` lists a victim's address | Tokens tie an announce to the address that requested one. |
 | A hostile DHT node names private addresses | Those addresses are dropped, so lookups cannot be aimed inside your network. |
+| A peer exchange message lists private addresses, or hundreds of victims | Private addresses are refused unless `--allow-private` is set, only the first 50 entries of a message are used, and messages faster than the agreed rate are ignored. |
+| A flood of fake DHT ids tries to push out real contacts | Newcomers wait in a replacement cache, and a contact is only replaced once it stops answering. |
+
+## Creating, verifying and scripting (0.2.0)
+
+`create` makes a torrent from a file or folder. Files are taken in name order and no creation date is
+written, so the same input always gives the same info hash. Without `--piece-length`, the piece size is
+the smallest power of two from 16 KiB that keeps the torrent near 2048 pieces, up to 16 MiB.
+
+```text
+$ rhizome create seed/photos --out photos.torrent
+wrote photos.torrent
+info hash:    e3846f7e1a3ab3fdd4a23048ee61d21281ab451b
+size:         420000 bytes in 26 pieces of 16384
+magnet:       magnet:?xt=urn:btih:e3846f7e1a3ab3fdd4a23048ee61d21281ab451b
+```
+
+Options: `--piece-length N` (bytes, or with a `K` or `M` suffix, a power of two from 16 KiB to 64 MiB),
+`--tracker URL` (repeatable) and `--private`. Symbolic links and unsafe file names are refused.
+
+`verify` hashes the data on disk and writes nothing. It exits with 0 when every piece checks out and 1
+otherwise.
+
+```text
+$ rhizome verify photos.torrent --dir seed
+pieces:       26 of 26 verified
+ok            photos/a.jpg
+ok            photos/raw/b.raw
+complete
+```
+
+Every command takes `--json`. `download --json` prints one object per line: `listening`, then
+`progress` each second, then `complete`.
+
+```text
+$ rhizome download photos.torrent --out dl --peer 127.0.0.1:51515 --no-dht --exit-when-done --json
+{"event":"listening","port":57931}
+{"event":"progress","info_hash":"e3846f7e1a3ab3fdd4a23048ee61d21281ab451b","name":"photos","state":"seeding","pieces_verified":26,"piece_count":26,"progress":1.0,"peers":1,"downloaded":420000,"uploaded":0,"hash_failures":0,"pex_peers_learned":0}
+{"event":"complete","info_hash":"e3846f7e1a3ab3fdd4a23048ee61d21281ab451b","name":"photos","state":"seeding","pieces_verified":26,"piece_count":26,"progress":1.0,"peers":1,"downloaded":420000,"uploaded":0,"hash_failures":0,"pex_peers_learned":0}
+$ rhizome verify photos.torrent --dir dl --json
+{"name":"photos","info_hash":"e3846f7e1a3ab3fdd4a23048ee61d21281ab451b","complete":true,"pieces_verified":26,"piece_count":26,"missing_pieces":[],"files":[{"path":["photos","a.jpg"],"length":300000,"complete":true},{"path":["photos","raw","b.raw"],"length":120000,"complete":true}]}
+```
+
+The seeder in that example was a second `rhizome download photos.torrent --out seed --port 51515 --no-dht`,
+which verifies the existing files and then seeds them. Errors with `--json` come out as
+`{"error":"..."}`. Exit codes are 0 for success, 1 for a failure and 2 for bad usage. `lookup` takes
+`--allow-private` for DHT nodes on private addresses, and `version` prints the version.
 
 ## Usage as a library
 
@@ -61,7 +118,10 @@ val session = client.add(Metainfo.parse(File("a.torrent").readBytes()), Paths.ge
 session.connect(InetSocketAddress("192.0.2.10", 6881))
 session.startDiscovery()
 session.awaitComplete()
+println(session.status().toMap())
 ```
+
+A long-running DHT node should call `node.startMaintenance()` to keep its routing table fresh.
 
 ## How it is tested
 
@@ -71,6 +131,12 @@ session.awaitComplete()
 - Scripted hostile peers send corrupt pieces, unsolicited blocks, forged metadata and malformed messages.
 - A real DHT network of 30 nodes on loopback checks that lookups reach the truly closest node and route
   around dead ones, and two clients find each other through it and transfer a file.
+- Three clients on loopback check that peer exchange introduces a leecher to a seeder it was never told
+  about, and that the duplicate connection this causes is resolved to exactly one.
+- The command line runs in-process: `create`, `info`, `verify`, `download` against a loopback seeder,
+  and `lookup` against a loopback DHT, with every `--json` line read back by a strict JSON parser.
+- Mutated torrents and random magnet links must fail only with `InvalidTorrent`, and random Bencode
+  values must round-trip to the same bytes.
 - The Bencode decoder and the message parser take random and truncated input.
 - Security checks were deliberately removed, one at a time, to confirm that the tests notice. Of the
   28 removed, 27 made the suite fail. The last is the check for `..` in file names, which a second rule

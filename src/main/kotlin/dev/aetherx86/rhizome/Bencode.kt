@@ -156,6 +156,11 @@ object Bencode {
                 val entries = value.entries
                     .map { (k, v) -> k as String to requireNotNull(v) }
                     .sortedBy { it.first }
+                // A key outside ISO-8859-1 would be written as '?', silently colliding with
+                // other keys and breaking the sort order, so it is refused instead.
+                for ((k, _) in entries) {
+                    require(k.all { it.code < 0x100 }) { "dictionary key is not a byte string: $k" }
+                }
                 for ((k, v) in entries) {
                     write(out, k.toByteArray(Charsets.ISO_8859_1))
                     write(out, v)

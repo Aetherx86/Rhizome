@@ -2,6 +2,9 @@ package dev.aetherx86.rhizome
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
@@ -38,6 +41,21 @@ object Xor {
     fun bucketIndex(own: ByteArray, other: ByteArray): Int = 159 - commonPrefix(own, other)
 
     /** Orders ids by distance to [target], comparing the XOR as a big-endian number. */
+    /**
+     * A random id whose bucket relative to [own] is [index]: the XOR distance has its highest set
+     * bit at position [index], counted from the least significant bit, and random bits below it.
+     */
+    fun randomIdInBucket(own: ByteArray, index: Int, random: java.util.Random): ByteArray {
+        require(index in 0 until 160) { "bucket $index does not exist" }
+        val distance = ByteArray(20)
+        val byte = 19 - index / 8
+        val bit = index % 8
+        val low = ByteArray(20).also { random.nextBytes(it) }
+        distance[byte] = ((1 shl bit) or (low[byte].toInt() and ((1 shl bit) - 1))).toByte()
+        for (i in byte + 1 until 20) distance[i] = low[i]
+        return ByteArray(20) { (own[it].toInt() xor distance[it].toInt()).toByte() }
+    }
+
     fun compareDistance(target: ByteArray, a: ByteArray, b: ByteArray): Int {
         for (i in 0 until 20) {
             val da = (a[i].toInt() xor target[i].toInt()) and 0xFF
@@ -50,36 +68,111 @@ object Xor {
 
 class Contact(val id: ByteArray, val address: InetSocketAddress) {
     var lastSeen: Long = System.nanoTime()
+
+    /** Queries in a row that this contact left unanswered. Any answer resets it. */
+    var failures: Int = 0
 }
 
-/** Kademlia routing table: 160 buckets of at most [k] contacts each. */
-class RoutingTable(private val own: ByteArray, private val k: Int = 8) {
-    private val buckets = Array(160) { ArrayList<Contact>() }
+/**
+ * Kademlia routing table: 160 buckets of at most [k] contacts each.
+ *
+ * A contact is good while it has been heard from within [staleAfterNanos], and questionable after
+ * that (BEP 5). A full bucket never drops a contact just because a newcomer turned up. The newcomer
+ * waits in a small replacement cache instead, and takes the place of a contact that is proven dead:
+ * one that missed [maxFailures] queries in a row, or a questionable one that missed a single query
+ * while a replacement was waiting.
+ */
+class RoutingTable(
+    private val own: ByteArray,
+    private val k: Int = 8,
+    private val staleAfterNanos: Long = 15L * 60 * 1_000_000_000,
+    private val maxFailures: Int = 2,
+) {
+    /** What [insert] did with a contact. */
+    enum class Insert {
+        /** The contact joined its bucket. */
+        ADDED,
 
-    /** Forgets contacts silent this long, but only to make room for a live one. */
-    private val staleAfterNanos = 15L * 60 * 1_000_000_000
+        /** The contact was already there, and is now marked as just seen. */
+        UPDATED,
+
+        /** The bucket is full of live contacts, so it waits in the replacement cache. */
+        CACHED,
+
+        /** The id is our own, which never goes in the table. */
+        IGNORED,
+    }
+
+    private val buckets = Array(160) { ArrayList<Contact>() }
+    private val replacements = Array(160) { ArrayList<Contact>() }
+    private val lastChanged = LongArray(160) { System.nanoTime() }
 
     @get:Synchronized
     val size: Int get() = buckets.sumOf { it.size }
 
+    /**
+     * Adds or refreshes a contact. A full bucket replaces its longest-silent contact if that one has
+     * been quiet for longer than the stale time. This is the behaviour of earlier versions, kept
+     * for callers that cannot ping. [DhtNode] uses [insert] and checks a contact before replacing it.
+     */
     @Synchronized
     fun add(id: ByteArray, address: InetSocketAddress, now: Long = System.nanoTime()) {
+        insert(id, address, now, replaceStale = true)
+    }
+
+    @Synchronized
+    fun insert(id: ByteArray, address: InetSocketAddress, now: Long = System.nanoTime(), replaceStale: Boolean): Insert {
         val index = Xor.bucketIndex(own, id)
-        if (index < 0) return
+        if (index < 0) return Insert.IGNORED
         val bucket = buckets[index]
         val existing = bucket.firstOrNull { it.id.contentEquals(id) }
         if (existing != null) {
             existing.lastSeen = now
-            return
+            existing.failures = 0
+            lastChanged[index] = now
+            return Insert.UPDATED
         }
         if (bucket.size >= k) {
             // Long-lived contacts are the most reliable, so a newcomer only replaces a dead one.
             // This also stops a flood of fake ids from pushing out real nodes.
             val oldest = bucket.minBy { it.lastSeen }
-            if (now - oldest.lastSeen < staleAfterNanos) return
+            if (!replaceStale || now - oldest.lastSeen < staleAfterNanos) {
+                cache(index, Contact(id, address).also { it.lastSeen = now })
+                return Insert.CACHED
+            }
             bucket.remove(oldest)
         }
+        replacements[index].removeAll { it.id.contentEquals(id) }
         bucket.add(Contact(id, address).also { it.lastSeen = now })
+        lastChanged[index] = now
+        return Insert.ADDED
+    }
+
+    private fun cache(index: Int, contact: Contact) {
+        val cache = replacements[index]
+        cache.removeAll { it.id.contentEquals(contact.id) }
+        cache.add(contact)
+        if (cache.size > k) cache.removeAt(0)
+    }
+
+    /**
+     * Records a query that [address] left unanswered. Returns true if that removed a contact from
+     * the table, in which case the freshest waiting replacement, if any, has taken its place.
+     */
+    @Synchronized
+    fun recordFailure(address: InetSocketAddress, now: Long = System.nanoTime()): Boolean {
+        for ((index, bucket) in buckets.withIndex()) {
+            val contact = bucket.firstOrNull { it.address == address } ?: continue
+            contact.failures++
+            val questionable = now - contact.lastSeen >= staleAfterNanos
+            val dead = contact.failures >= maxFailures || (questionable && replacements[index].isNotEmpty())
+            if (!dead) return false
+            bucket.remove(contact)
+            replacements[index].removeLastOrNull()?.let { bucket.add(it) }
+            lastChanged[index] = now
+            return true
+        }
+        return false
     }
 
     @Synchronized
@@ -100,7 +193,53 @@ class RoutingTable(private val own: ByteArray, private val k: Int = 8) {
 
     @Synchronized
     fun bucketSize(index: Int): Int = buckets[index].size
+
+    /** How many contacts wait in a bucket's replacement cache. */
+    @Synchronized
+    fun replacementCount(index: Int): Int = replacements[index].size
+
+    /** The longest-silent questionable contact of a bucket, or null if every contact is good. */
+    @Synchronized
+    fun questionableIn(index: Int, now: Long = System.nanoTime()): Contact? =
+        buckets[index].filter { now - it.lastSeen >= staleAfterNanos }.minByOrNull { it.lastSeen }
+
+    /** Every questionable contact, longest silent first. */
+    @Synchronized
+    fun questionable(now: Long = System.nanoTime()): List<Contact> =
+        buckets.flatMap { it }.filter { now - it.lastSeen >= staleAfterNanos }.sortedBy { it.lastSeen }
+
+    /**
+     * Buckets due a refresh: unchanged for the stale time, and no closer to our id than the closest
+     * non-empty bucket, since in a fixed table the buckets past that one cover almost no nodes.
+     * The longest unchanged come first.
+     */
+    @Synchronized
+    fun bucketsToRefresh(now: Long = System.nanoTime()): List<Int> {
+        val lowest = buckets.indexOfFirst { it.isNotEmpty() }
+        if (lowest < 0) return emptyList()
+        return (lowest until 160).filter { now - lastChanged[it] >= staleAfterNanos }.sortedBy { lastChanged[it] }
+    }
+
+    /** Marks a bucket as just refreshed, whether or not the refresh found anything new. */
+    @Synchronized
+    fun markRefreshed(index: Int, now: Long = System.nanoTime()) {
+        lastChanged[index] = now
+    }
+
+    /** A random id that falls in bucket [index], which is what a refresh looks up. */
+    fun randomIdInBucket(index: Int, random: java.util.Random = SecureRandom()): ByteArray =
+        Xor.randomIdInBucket(own, index, random)
 }
+
+/** What one round of routing table upkeep did. */
+class MaintenanceReport(
+    /** Questionable contacts that were pinged. */
+    val pinged: Int,
+    /** Contacts removed from the table because they stopped answering. */
+    val evicted: Int,
+    /** Buckets refreshed with a lookup for a random id in their range. */
+    val refreshed: Int,
+)
 
 class LookupResult(
     val peers: List<InetSocketAddress>,
@@ -114,15 +253,28 @@ class DhtNode(
     val id: ByteArray = ByteArray(20).also { SecureRandom().nextBytes(it) },
     private val allowPrivateAddresses: Boolean = false,
     private val queryTimeoutMillis: Long = 1_500,
+    /** How long a contact or bucket may go unheard before it counts as questionable (BEP 5). */
+    bucketRefreshMillis: Long = 15L * 60 * 1000,
 ) : AutoCloseable {
-    private class Pending(val address: InetSocketAddress, val result: CompletableDeferred<BDict?>)
+    private class Pending(val address: InetSocketAddress, val result: CompletableDeferred<BDict?>) {
+        /** Set by any reply, error replies included, so a timeout can be told apart from a refusal. */
+        @Volatile
+        var answered = false
+    }
 
     private val socket = DatagramSocket(port)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val random = SecureRandom()
     private val transaction = AtomicInteger(random.nextInt())
     private val pending = ConcurrentHashMap<Int, Pending>()
-    val table = RoutingTable(id)
+    val table = RoutingTable(id, K, bucketRefreshMillis * 1_000_000)
+
+    /** Questionable contacts with a ping in flight, so a busy bucket does not ping one twice. */
+    private val checking = ConcurrentHashMap.newKeySet<InetSocketAddress>()
+    private val evictions = AtomicInteger()
+
+    /** Contacts removed from the routing table because they stopped answering. */
+    val evicted: Int get() = evictions.get()
 
     private val lastVerified = LinkedHashMap<InetSocketAddress, Long>()
     private val sentQueries = AtomicInteger()
@@ -175,6 +327,7 @@ class DhtNode(
         // Only the node that was asked can answer, so an attacker has to spoof its address.
         if (entry.address != from) return
         pending.remove(key)
+        entry.answered = true
         val responder = body?.bytes("id")
         if (responder == null || responder.size != 20) {
             entry.result.complete(null)
@@ -182,8 +335,24 @@ class DhtNode(
         }
         // A node goes in the routing table only after it answers, because the source address of
         // an incoming query could be forged.
-        if (isAllowed(from)) table.add(responder, from)
+        if (isAllowed(from) && table.insert(responder, from, replaceStale = false) == RoutingTable.Insert.CACHED) {
+            // The bucket is full. If one of its contacts has gone quiet, find out whether it is
+            // still there, so that a dead one makes room for the node that just answered.
+            val index = Xor.bucketIndex(id, responder)
+            table.questionableIn(index)?.let { checkContact(it.address) }
+        }
         entry.result.complete(body)
+    }
+
+    private fun checkContact(address: InetSocketAddress) {
+        if (!checking.add(address)) return
+        scope.launch {
+            try {
+                ping(address)
+            } finally {
+                checking.remove(address)
+            }
+        }
     }
 
     private fun isAllowed(address: InetSocketAddress): Boolean =
@@ -359,7 +528,9 @@ class DhtNode(
         sentQueries.incrementAndGet()
         send(to, mapOf("t" to tx, "y" to "q", "q" to method, "a" to args + ("id" to id)))
         try {
-            return withTimeoutOrNull(queryTimeoutMillis) { entry.result.await() }
+            val result = withTimeoutOrNull(queryTimeoutMillis) { entry.result.await() }
+            if (result == null && !entry.answered && table.recordFailure(to)) evictions.incrementAndGet()
+            return result
         } finally {
             pending.remove(key)
         }
@@ -433,6 +604,35 @@ class DhtNode(
         return LookupResult(peers.toList(), sorted)
     }
 
+    /**
+     * One round of routing table upkeep (BEP 5). Buckets nobody has touched for the stale time are
+     * refreshed with a lookup for a random id in their range. Those lookups hear from many
+     * contacts on the way, so only the contacts still questionable afterwards are pinged, to find
+     * dead ones and replace them. Both steps are capped per round to bound traffic.
+     */
+    suspend fun maintain(): MaintenanceReport {
+        val before = evictions.get()
+        var refreshed = 0
+        for (index in table.bucketsToRefresh().take(MAX_REFRESHES_PER_ROUND)) {
+            table.markRefreshed(index)
+            findNode(table.randomIdInBucket(index, random))
+            refreshed++
+        }
+        val suspects = table.questionable().take(MAX_PINGS_PER_ROUND)
+        coroutineScope {
+            suspects.map { async { ping(it.address) } }.awaitAll()
+        }
+        return MaintenanceReport(suspects.size, evictions.get() - before, refreshed)
+    }
+
+    /** Runs [maintain] every [intervalMillis] until the node closes. */
+    fun startMaintenance(intervalMillis: Long = 60_000): Job = scope.launch {
+        while (isActive) {
+            delay(intervalMillis)
+            runCatching { maintain() }
+        }
+    }
+
     /** Tells the nodes closest to a torrent that this machine has it, using their tokens. */
     suspend fun announce(infoHash: ByteArray, peerPort: Int, lookup: LookupResult? = null): Int {
         val closest = (lookup ?: getPeers(infoHash)).closest
@@ -467,5 +667,7 @@ class DhtNode(
         const val PEER_TTL_NANOS = 30L * 60 * 1_000_000_000
         const val VERIFY_INTERVAL_NANOS = 10L * 60 * 1_000_000_000
         const val MAX_VERIFY_ENTRIES = 8192
+        const val MAX_PINGS_PER_ROUND = 16
+        const val MAX_REFRESHES_PER_ROUND = 8
     }
 }
